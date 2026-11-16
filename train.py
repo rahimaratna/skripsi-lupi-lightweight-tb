@@ -156,6 +156,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--output_dir", type=str, default="outputs")
+    parser.add_argument("--reports_dir", type=str, default="", help="Folder berisi file .txt laporan klinis untuk mode LUPI")
     return parser.parse_args()
 
 
@@ -181,6 +182,7 @@ def main():
         use_balanced_sampler=True,
         num_workers=args.num_workers,
         root_dir=args.root_dir,
+        reports_dir=args.reports_dir,
     )
     val_loader = create_dataloader(
         csv_path=args.val_csv,
