@@ -54,14 +54,28 @@ class ImbalancedDatasetSampler(Sampler):
         return self.num_samples
 
 
+def load_split_dataframe(csv_path: str) -> pd.DataFrame:
+    """Membaca CSV baik yang memiliki header maupun yang tanpa header (kolom 0=filename, kolom 1=label)."""
+    df_peek = pd.read_csv(csv_path, nrows=1, header=None)
+    first_val = str(df_peek.iloc[0, 0]).strip().lower()
+    known_headers = {"image_path", "filepath", "path", "filename", "img", "image"}
+
+    if first_val in known_headers:
+        return pd.read_csv(csv_path)
+    else:
+        df = pd.read_csv(csv_path, header=None)
+        if df.shape[1] == 2:
+            df.columns = ["image_path", "label"]
+        elif df.shape[1] >= 3:
+            df.columns = ["image_path", "label", "report"] + [f"extra_{i}" for i in range(df.shape[1] - 3)]
+        else:
+            raise ValueError(f"Format CSV tidak dikenali ({df.shape[1]} kolom) pada {csv_path}")
+        return df
+
+
 class TBMultimodalDataset(Dataset):
     """
-    Dataset serbaguna untuk mode Unimodal (citra saja) maupun Multimodal LUPI (citra + teks).
-    Kolom wajib pada CSV:
-      - 'image_path' (atau 'filepath')
-      - 'label' (0 = Normal, 1 = TB, atau string 'normal'/'tb')
-    Kolom opsional (wajib saat mode='lupi' pada split train):
-      - 'report' (atau 'text' / 'findings')
+    Dataset untuk mode Unimodal (citra saja) dan Multimodal LUPI (citra + laporan .txt).
     """
     def __init__(
         self,
@@ -71,6 +85,7 @@ class TBMultimodalDataset(Dataset):
         max_len: int = 256,
         require_text: bool = False,
         root_dir: str = "",
+        reports_dir: str = "",
     ):
         self.df = df.reset_index(drop=True).copy()
         self.transform = transform
@@ -78,38 +93,62 @@ class TBMultimodalDataset(Dataset):
         self.max_len = max_len
         self.require_text = require_text
         self.root_dir = root_dir
+        self.reports_dir = reports_dir
 
-        # Deteksi nama kolom path citra
-        for col in ["image_path", "filepath", "path", "filename"]:
+        for col in ["image_path", "filepath", "path", "filename", "img"]:
             if col in self.df.columns:
                 self.img_col = col
                 break
         else:
             raise ValueError(f"Kolom path citra tidak ditemukan. Kolom tersedia: {list(self.df.columns)}")
 
-        # Deteksi nama kolom teks klinis
         self.txt_col = None
         for col in ["report", "text", "findings", "clinical_report"]:
             if col in self.df.columns:
                 self.txt_col = col
                 break
 
-        if self.require_text and self.txt_col is None:
-            raise ValueError("Mode LUPI membutuhkan kolom teks laporan ('report'/'text') pada data train.")
+        if self.require_text and (self.txt_col is None) and (not self.reports_dir or not os.path.isdir(self.reports_dir)):
+            raise ValueError(
+                "Mode LUPI membutuhkan kolom teks pada CSV atau folder --reports_dir yang valid."
+            )
 
-        # Normalisasi label ke integer {0, 1}
         if self.df["label"].dtype == object:
             label_map = {"normal": 0, "no_tb": 0, "0": 0, "tb": 1, "tuberculosis": 1, "1": 1}
             self.labels = self.df["label"].astype(str).str.lower().str.strip().map(label_map).astype(int).tolist()
         else:
             self.labels = self.df["label"].astype(int).tolist()
 
+    def _read_report_text(self, row: pd.Series, raw_img_name: str) -> str:
+        # 1. Jika ada kolom teks langsung di CSV
+        if self.txt_col is not None and pd.notna(row[self.txt_col]):
+            val = str(row[self.txt_col]).strip()
+            if val.endswith(".txt") and self.reports_dir:
+                txt_path = os.path.join(self.reports_dir, os.path.basename(val))
+                if os.path.exists(txt_path):
+                    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                        return f.read().strip()
+            return val
+
+        # 2. Cari file .txt di folder reports_dir berdasarkan nama file citra (misal CHNCXR_0278_0.png -> CHNCXR_0278_0.txt)
+        if self.reports_dir:
+            stem = os.path.splitext(os.path.basename(raw_img_name))[0]
+            txt_path = os.path.join(self.reports_dir, f"{stem}.txt")
+            if os.path.exists(txt_path):
+                with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().strip()
+                    if content:
+                        return content
+
+        return "No clinical findings."
+
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.df.iloc[idx]
-        img_path = str(row[self.img_col])
+        raw_img_name = str(row[self.img_col]).strip()
+        img_path = raw_img_name
         if self.root_dir and not os.path.isabs(img_path):
             img_path = os.path.join(self.root_dir, img_path)
 
@@ -126,7 +165,7 @@ class TBMultimodalDataset(Dataset):
         }
 
         if self.require_text and self.tokenizer is not None:
-            raw_text = str(row[self.txt_col]) if pd.notna(row[self.txt_col]) else "No clinical findings."
+            raw_text = self._read_report_text(row, raw_img_name)
             enc = self.tokenizer(
                 raw_text,
                 padding="max_length",
@@ -158,8 +197,9 @@ def create_dataloader(
     use_balanced_sampler: bool = True,
     num_workers: int = 2,
     root_dir: str = "",
+    reports_dir: str = "",
 ) -> DataLoader:
-    df = pd.read_csv(csv_path)
+    df = load_split_dataframe(csv_path)
     train_tf, eval_tf = get_transforms(img_size=img_size)
     tf = train_tf if is_train else eval_tf
 
@@ -170,6 +210,7 @@ def create_dataloader(
         max_len=max_len,
         require_text=require_text,
         root_dir=root_dir,
+        reports_dir=reports_dir,
     )
 
     sampler = ImbalancedDatasetSampler(ds.labels) if (is_train and use_balanced_sampler) else None
