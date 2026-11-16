@@ -1,7 +1,6 @@
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 import cv2
-import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -31,7 +30,6 @@ def get_transforms(img_size: int = 224) -> Tuple[A.Compose, A.Compose]:
 
 
 class ImbalancedDatasetSampler(Sampler):
-    """Oversampling berbasis invers frekuensi kelas agar batch training seimbang."""
     def __init__(self, labels: list):
         self.indices = list(range(len(labels)))
         self.num_samples = len(self.indices)
@@ -55,7 +53,6 @@ class ImbalancedDatasetSampler(Sampler):
 
 
 def load_split_dataframe(csv_path: str) -> pd.DataFrame:
-    """Membaca CSV baik yang memiliki header maupun yang tanpa header (kolom 0=filename, kolom 1=label)."""
     df_peek = pd.read_csv(csv_path, nrows=1, header=None)
     first_val = str(df_peek.iloc[0, 0]).strip().lower()
     known_headers = {"image_path", "filepath", "path", "filename", "img", "image"}
@@ -74,9 +71,6 @@ def load_split_dataframe(csv_path: str) -> pd.DataFrame:
 
 
 class TBMultimodalDataset(Dataset):
-    """
-    Dataset untuk mode Unimodal (citra saja) dan Multimodal LUPI (citra + laporan .txt).
-    """
     def __init__(
         self,
         df: pd.DataFrame,
@@ -109,9 +103,7 @@ class TBMultimodalDataset(Dataset):
                 break
 
         if self.require_text and (self.txt_col is None) and (not self.reports_dir or not os.path.isdir(self.reports_dir)):
-            raise ValueError(
-                "Mode LUPI membutuhkan kolom teks pada CSV atau folder --reports_dir yang valid."
-            )
+            raise ValueError("Mode LUPI membutuhkan kolom teks pada CSV atau folder --reports_dir yang valid.")
 
         if self.df["label"].dtype == object:
             label_map = {"normal": 0, "no_tb": 0, "0": 0, "tb": 1, "tuberculosis": 1, "1": 1}
@@ -120,7 +112,6 @@ class TBMultimodalDataset(Dataset):
             self.labels = self.df["label"].astype(int).tolist()
 
     def _read_report_text(self, row: pd.Series, raw_img_name: str) -> str:
-        # 1. Jika ada kolom teks langsung di CSV
         if self.txt_col is not None and pd.notna(row[self.txt_col]):
             val = str(row[self.txt_col]).strip()
             if val.endswith(".txt") and self.reports_dir:
@@ -130,7 +121,6 @@ class TBMultimodalDataset(Dataset):
                         return f.read().strip()
             return val
 
-        # 2. Cari file .txt di folder reports_dir berdasarkan nama file citra (misal CHNCXR_0278_0.png -> CHNCXR_0278_0.txt)
         if self.reports_dir:
             stem = os.path.splitext(os.path.basename(raw_img_name))[0]
             txt_path = os.path.join(self.reports_dir, f"{stem}.txt")

@@ -8,16 +8,10 @@ from transformers import AutoModel
 
 
 class VisionEncoderWrapper(nn.Module):
-    """
-    Wrapper terstandarisasi untuk 5 arsitektur eksperimen M1-M5:
-      - M1: vgg11
-      - M2: mobilenetv3 (mobilenet_v3_large)
-      - M3: shufflenetv2 (shufflenet_v2_x1_0)
-      - M4: efficientnet_b0
-      - M5: starnet (starnet_s3 via timm) atau vit (vit_tiny_patch16_224)
-    """
     SUPPORTED = {
         "vgg11",
+        "resnet18",
+        "densenet121",
         "mobilenetv3",
         "shufflenetv2",
         "efficientnet_b0",
@@ -25,7 +19,9 @@ class VisionEncoderWrapper(nn.Module):
         "vit",
     }
 
-    def __init__(self, backbone_name: str = "vgg11", pretrained: bool = True):
+    def __init__(self, backbone_name: str = "vgg11",
+        "resnet18",
+        "densenet121", pretrained: bool = True):
         super().__init__()
         name = backbone_name.lower().strip()
         if name not in self.SUPPORTED:
@@ -39,6 +35,22 @@ class VisionEncoderWrapper(nn.Module):
             self.features = m.features
             self.pool = nn.AdaptiveAvgPool2d((1, 1))
             self.out_dim = 512
+            self.is_timm = False
+
+        elif name == "resnet18":
+            weights = tvm.ResNet18_Weights.DEFAULT if pretrained else None
+            m = tvm.resnet18(weights=weights)
+            self.features = nn.Sequential(*list(m.children())[:-2])
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.out_dim = 512
+            self.is_timm = False
+
+        elif name == "densenet121":
+            weights = tvm.DenseNet121_Weights.DEFAULT if pretrained else None
+            m = tvm.densenet121(weights=weights)
+            self.features = nn.Sequential(m.features, nn.ReLU(inplace=True))
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.out_dim = 1024
             self.is_timm = False
 
         elif name == "mobilenetv3":
@@ -86,30 +98,13 @@ class VisionEncoderWrapper(nn.Module):
         return feat
 
 
-class ProjectionHead(nn.Module):
-    """Memproyeksikan fitur modalitas ke ruang laten bersama berdimensi proj_dim (256)."""
-    def __init__(self, in_dim: int, proj_dim: int = 256, dropout: float = 0.2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, proj_dim),
-            nn.BatchNorm1d(proj_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(proj_dim, proj_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
 class PrivilegedTextEncoder(nn.Module):
-    """Encoder teks klinis untuk LUPI (hanya digunakan saat fase training)."""
     def __init__(
         self,
         model_name: str = "microsoft/BiomedVLP-CXR-BERT-general",
         proj_dim: int = 256,
-        freeze_policy: str = "last_n",
-        unfreeze_last_n: int = 2,
+        freeze_policy: str = "freeze_all",
+        unfreeze_last_n: int = 0,
     ):
         super().__init__()
         try:
@@ -118,7 +113,8 @@ class PrivilegedTextEncoder(nn.Module):
             self.encoder = AutoModel.from_pretrained(model_name, trust_remote_code=True)
 
         hidden_dim = self.encoder.config.hidden_size
-        self.proj = ProjectionHead(hidden_dim, proj_dim=proj_dim)
+        self.dropout = nn.Dropout(0.1)
+        self.proj = nn.Linear(hidden_dim, proj_dim)
         self._apply_freeze_policy(freeze_policy, unfreeze_last_n)
 
     def _apply_freeze_policy(self, policy: str, last_n: int):
@@ -136,36 +132,38 @@ class PrivilegedTextEncoder(nn.Module):
                         p.requires_grad = True
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        token_emb = out.last_hidden_state
-        mask = attention_mask.unsqueeze(-1).expand(token_emb.size()).float()
-        pooled = torch.sum(token_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-        z_txt = self.proj(pooled)
-        return F.normalize(z_txt, p=2, dim=-1)
+        with torch.no_grad():
+            out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            token_emb = out.last_hidden_state
+            mask = attention_mask.unsqueeze(-1).expand(token_emb.size()).float()
+            pooled = torch.sum(token_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
+
+        h_txt = self.dropout(pooled)
+        z_txt = self.proj(h_txt)
+        return z_txt
 
 
 class TBClassifierLUPI(nn.Module):
-    """
-    Model utama untuk skema Unimodal maupun Multimodal LUPI.
-    Saat inferensi (input_ids=None), cabang teks tidak dieksekusi sama sekali.
-    """
     def __init__(
         self,
         backbone_name: str = "vgg11",
+        "resnet18",
+        "densenet121",
         mode: str = "unimodal",
         proj_dim: int = 256,
         num_classes: int = 2,
         pretrained: bool = True,
         text_model_name: str = "microsoft/BiomedVLP-CXR-BERT-general",
-        text_freeze_policy: str = "last_n",
-        unfreeze_last_n: int = 2,
+        text_freeze_policy: str = "freeze_all",
+        unfreeze_last_n: int = 0,
     ):
         super().__init__()
         assert mode in {"unimodal", "lupi"}, "mode harus 'unimodal' atau 'lupi'"
         self.mode = mode
 
         self.vision_encoder = VisionEncoderWrapper(backbone_name=backbone_name, pretrained=pretrained)
-        self.vision_proj = ProjectionHead(self.vision_encoder.out_dim, proj_dim=proj_dim)
+        self.vision_dropout = nn.Dropout(0.3)
+        self.vision_proj = nn.Linear(self.vision_encoder.out_dim, proj_dim)
         self.classifier = nn.Linear(proj_dim, num_classes)
 
         self.text_encoder: Optional[PrivilegedTextEncoder] = None
@@ -184,17 +182,19 @@ class TBClassifierLUPI(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         v_feat = self.vision_encoder(image)
-        z_img_raw = self.vision_proj(v_feat)
-        logits = self.classifier(z_img_raw)
-        z_img = F.normalize(z_img_raw, p=2, dim=-1)
+        h_img = self.vision_dropout(v_feat)
+        z_img = self.vision_proj(h_img)
+        logits_img = self.classifier(z_img)
 
         outputs = {
-            "logits": logits,
-            "z_img": z_img,
+            "logits": logits_img,
+            "z_img": F.normalize(z_img, p=2, dim=-1),
         }
 
         if self.mode == "lupi" and self.training and (input_ids is not None) and (attention_mask is not None):
             z_txt = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-            outputs["z_txt"] = z_txt
+            logits_txt = self.classifier(z_txt)
+            outputs["logits_txt"] = logits_txt
+            outputs["z_txt"] = F.normalize(z_txt, p=2, dim=-1)
 
         return outputs

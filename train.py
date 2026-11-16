@@ -35,23 +35,29 @@ def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0
 
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+    youden_j = sensitivity + specificity - 1.0
     try:
         auc = float(roc_auc_score(y_true, y_prob))
     except ValueError:
         auc = 0.0
 
     return {
-        "mcc": float(matthews_corrcoef(y_true, y_pred)),
-        "balanced_acc": float(balanced_accuracy_score(y_true, y_pred)),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "roc_auc": auc,
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "sensitivity": float(sensitivity),
-        "specificity": float(specificity),
         "tp": int(tp),
-        "tn": int(tn),
         "fp": int(fp),
         "fn": int(fn),
+        "tn": int(tn),
+        "balanced_acc": float(balanced_accuracy_score(y_true, y_pred)),
+        "sensitivity": float(sensitivity),
+        "specificity": float(specificity),
+        "precision": float(precision),
+        "npv": float(npv),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "mcc": float(matthews_corrcoef(y_true, y_pred)),
+        "youden_j": float(youden_j),
+        "roc_auc": auc,
+        "accuracy": float(accuracy_score(y_true, y_pred)),
     }
 
 
@@ -108,6 +114,7 @@ def train_one_epoch(
                 labels=labels,
                 z_img=out.get("z_img"),
                 z_txt=out.get("z_txt"),
+                logits_txt=out.get("logits_txt"),
             )
             loss = loss_dict["loss"]
 
@@ -133,7 +140,7 @@ def train_one_epoch(
 def parse_args():
     parser = argparse.ArgumentParser(description="Eksperimen TB Classification: Unimodal vs Multimodal LUPI")
     parser.add_argument("--backbone", type=str, required=True,
-                        choices=["vgg11", "mobilenetv3", "shufflenetv2", "efficientnet_b0", "starnet", "vit"],
+                        choices=["vgg11", "resnet18", "densenet121", "mobilenetv3", "shufflenetv2", "efficientnet_b0", "starnet", "vit"],
                         help="Pilihan vision encoder M1-M5")
     parser.add_argument("--mode", type=str, required=True, choices=["unimodal", "lupi"],
                         help="Skema pelatihan: unimodal atau lupi")
@@ -143,7 +150,8 @@ def parse_args():
     parser.add_argument("--test_shenzhen_csv", type=str, required=True, help="CSV split test Shenzhen")
     parser.add_argument("--test_montgomery_csv", type=str, default="", help="CSV uji eksternal Montgomery")
     parser.add_argument("--test_tbx11k_csv", type=str, default="", help="CSV uji eksternal TBX11K")
-    parser.add_argument("--root_dir", type=str, default="", help="Prefix folder gambar jika path di CSV relatif")
+    parser.add_argument("--root_dir", type=str, default="", help="Prefix folder gambar")
+    parser.add_argument("--reports_dir", type=str, default="", help="Folder berisi file .txt laporan klinis")
 
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -156,7 +164,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--output_dir", type=str, default="outputs")
-    parser.add_argument("--reports_dir", type=str, default="", help="Folder berisi file .txt laporan klinis untuk mode LUPI")
     return parser.parse_args()
 
 
@@ -260,8 +267,7 @@ def main():
 
     pd.DataFrame(history).to_csv(os.path.join(save_dir, "training_history.csv"), index=False)
 
-    print("
-=== Memuat Checkpoint Terbaik untuk Evaluasi Test & Eksternal ===")
+    print("=== Memuat Checkpoint Terbaik untuk Evaluasi Test & Eksternal ===")
     ckpt = torch.load(best_ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
 
