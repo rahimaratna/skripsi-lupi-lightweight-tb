@@ -98,29 +98,40 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
     y_pred = np.array(all_preds)
     y_prob = np.array(all_probs)
 
-    mcc = matthews_corrcoef(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    sens = recall_score(y_true, y_pred, zero_division=0)  # Sensitivity / TPR
-
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0  # Specificity / TNR
+
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0          # Sensitivity / Recall / TPR
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0          # Specificity / TNR
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0          # Precision / PPV
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0           # Negative Predictive Value
+    bal_acc = 0.5 * (sens + spec)                            # Balanced Accuracy
+    youden_j = sens + spec - 1.0                             # Youden's J statistic
+    acc = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
 
     try:
-        auc = roc_auc_score(y_true, y_prob)
+        auroc = roc_auc_score(y_true, y_prob)
     except ValueError:
-        auc = 0.0
+        auroc = 0.0
 
     return {
-        "auc": float(auc),
-        "mcc": float(mcc),
+        "tp": int(tp),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tn": int(tn),
+        "bal_acc": float(bal_acc),
         "sens": float(sens),
         "spec": float(spec),
+        "prec": float(prec),
+        "npv": float(npv),
         "f1": float(f1),
+        "mcc": float(mcc),
+        "j": float(youden_j),
+        "auroc": float(auroc),
+        "auc": float(auroc),  # alias untuk kompatibilitas
         "acc": float(acc),
-        "precision": float(prec),
         "confusion_matrix": cm.tolist(),
     }
 
