@@ -6,15 +6,13 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from transformers import AutoTokenizer
 from sklearn.metrics import (
     matthews_corrcoef,
     f1_score,
     roc_auc_score,
     accuracy_score,
-    precision_score,
-    recall_score,
     confusion_matrix,
 )
 
@@ -65,9 +63,9 @@ def load_splits(args):
     val_path = os.path.join(args.data_dir, "val.csv")
     test_path = os.path.join(args.data_dir, "test.csv")
     if os.path.exists(train_path) and os.path.exists(val_path):
-        train_df = pd.read_csv(train_path)
-        val_df = pd.read_csv(val_path)
-        test_df = pd.read_csv(test_path) if os.path.exists(test_path) else None
+        train_df = read_split_csv(train_path)
+        val_df = read_split_csv(val_path)
+        test_df = read_split_csv(test_path) if os.path.exists(test_path) else None
         return train_df, val_df, test_df
 
     raise FileNotFoundError(
@@ -75,38 +73,36 @@ def load_splits(args):
     )
 
 
-@torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
-    model.eval()
-    all_labels = []
-    all_preds = []
-    all_probs = []
+def build_inverse_freq_sampler(dataset: TBMultimodalDataset, seed: int) -> WeightedRandomSampler:
+    """
+    Inverse-frequency weighted sampling dengan replacement (Rajaraman et al., 2026, hlm. 3).
+    """
+    labels = [sample["label"] for sample in dataset.samples]
+    class_counts = np.bincount(labels)
+    class_weights = 1.0 / np.maximum(class_counts, 1)
+    sample_weights = torch.DoubleTensor([class_weights[y] for y in labels])
 
-    for batch in loader:
-        images = batch["image"].to(device, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+        generator=generator,
+    )
 
-        logits = model(images)
-        probs = torch.softmax(logits, dim=-1)[:, 1]
-        preds = torch.argmax(logits, dim=-1)
 
-        all_labels.extend(labels.cpu().numpy())
-        all_preds.extend(preds.cpu().numpy())
-        all_probs.extend(probs.cpu().numpy())
-
-    y_true = np.array(all_labels)
-    y_pred = np.array(all_preds)
-    y_prob = np.array(all_probs)
-
+def compute_metrics_from_probs(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.50) -> dict:
+    y_pred = (y_prob >= threshold).astype(int)
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
-    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0          # Sensitivity / Recall / TPR
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0          # Specificity / TNR
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0          # Precision / PPV
-    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0           # Negative Predictive Value
-    bal_acc = 0.5 * (sens + spec)                            # Balanced Accuracy
-    youden_j = sens + spec - 1.0                             # Youden's J statistic
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+    bal_acc = 0.5 * (sens + spec)
+    youden_j = sens + spec - 1.0
     acc = accuracy_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred, zero_division=0)
     mcc = matthews_corrcoef(y_true, y_pred)
@@ -117,6 +113,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
         auroc = 0.0
 
     return {
+        "threshold": float(threshold),
         "tp": int(tp),
         "fp": int(fp),
         "fn": int(fn),
@@ -130,10 +127,55 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
         "mcc": float(mcc),
         "j": float(youden_j),
         "auroc": float(auroc),
-        "auc": float(auroc),  # alias untuk kompatibilitas
+        "auc": float(auroc),
         "acc": float(acc),
         "confusion_matrix": cm.tolist(),
     }
+
+
+@torch.no_grad()
+def predict_probs(model: nn.Module, loader: DataLoader, device: torch.device):
+    model.eval()
+    all_labels = []
+    all_probs = []
+
+    for batch in loader:
+        images = batch["image"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+
+        logits = model(images)
+        probs = torch.softmax(logits, dim=-1)[:, 1]
+
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+
+    return np.array(all_labels), np.array(all_probs)
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, threshold: float = 0.50):
+    y_true, y_prob = predict_probs(model, loader, device)
+    return compute_metrics_from_probs(y_true, y_prob, threshold=threshold)
+
+
+def find_optimal_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """
+    Mencari threshold optimal t* pada validation set untuk memaksimalkan MCC
+    (tanpa menyentuh test set sehingga bebas data leakage).
+    """
+    best_thresh = 0.50
+    best_mcc = matthews_corrcoef(y_true, (y_prob >= 0.50).astype(int))
+
+    for thresh in np.linspace(0.10, 0.90, 161):
+        preds = (y_prob >= thresh).astype(int)
+        if len(np.unique(preds)) < 2:
+            continue
+        mcc = matthews_corrcoef(y_true, preds)
+        if mcc > best_mcc + 1e-6:
+            best_mcc = mcc
+            best_thresh = float(thresh)
+
+    return round(best_thresh, 4)
 
 
 def main():
@@ -142,7 +184,7 @@ def main():
     )
     parser.add_argument("--model_code", type=str, default="M1-L")
     parser.add_argument("--mode", type=str, default="lupi", choices=["unimodal", "lupi"])
-    parser.add_argument("--backbone", type=str, default="vgg11")
+    parser.add_argument("--backbone", type=str, default="vgg11_bn")
     parser.add_argument(
         "--text_model", type=str, default="microsoft/BiomedVLP-CXR-BERT-general"
     )
@@ -170,7 +212,7 @@ def main():
         "--test_csvs",
         nargs="*",
         default=[],
-        help="Pasangan NamaDataset=PathCSV, contoh: Shenzhen=/path/label_test.csv Montgomery=/path/label_test_mont.csv",
+        help="Pasangan NamaDataset=PathCSV, contoh: Shenzhen=/path/label_test.csv",
     )
     args = parser.parse_args()
 
@@ -214,10 +256,12 @@ def main():
         require_report=False,
     )
 
+    train_sampler = build_inverse_freq_sampler(train_dataset, seed=args.seed)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=(args.mode == "lupi"),
@@ -314,7 +358,7 @@ def main():
             steps += 1
 
         avg_loss = running_loss / max(steps, 1)
-        val_metrics = evaluate(model, val_loader, device)
+        val_metrics = evaluate(model, val_loader, device, threshold=0.50)
         val_mcc = val_metrics["mcc"]
 
         row_log = {
@@ -369,15 +413,27 @@ def main():
 
     pd.DataFrame(history).to_csv(os.path.join(args.output_dir, "history.csv"), index=False)
 
+    # Muat checkpoint terbaik & kalibrasi threshold optimal t* pada validation set
+    ckpt = torch.load(best_ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+
+    val_y_true, val_y_prob = predict_probs(model, val_loader, device)
+    optimal_threshold = find_optimal_threshold(val_y_true, val_y_prob)
+    val_calibrated = compute_metrics_from_probs(val_y_true, val_y_prob, threshold=optimal_threshold)
+    print(
+        f"Kalibrasi Validation Set -> Optimal Threshold t* = {optimal_threshold:.4f} "
+        f"(Val MCC: {best_val_mcc:.4f} -> {val_calibrated['mcc']:.4f})"
+    )
+
     summary = {
         "model_code": args.model_code,
         "config": vars(args),
         "efficiency": efficiency,
         "best_epoch": best_epoch,
         "best_val_mcc": best_val_mcc,
+        "optimal_threshold": optimal_threshold,
     }
 
-    # Evaluasi akhir pada seluruh Test Set yang diberikan (Shenzhen, Montgomery, TBX11K)
     test_targets = []
     if args.test_csvs:
         for item in args.test_csvs:
@@ -389,9 +445,8 @@ def main():
         test_targets.append(("Default", args.test_csv))
 
     if len(test_targets) > 0:
-        ckpt = torch.load(best_ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
         summary["test_results"] = {}
+        summary["test_results_thresh50"] = {}
 
         print("-" * 75)
         for ds_name, ds_path in test_targets:
@@ -412,12 +467,16 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=True,
             )
-            metrics = evaluate(model, test_loader, device)
-            summary["test_results"][ds_name] = metrics
+            y_true_t, y_prob_t = predict_probs(model, test_loader, device)
+            metrics_cal = compute_metrics_from_probs(y_true_t, y_prob_t, threshold=optimal_threshold)
+            metrics_50 = compute_metrics_from_probs(y_true_t, y_prob_t, threshold=0.50)
+
+            summary["test_results"][ds_name] = metrics_cal
+            summary["test_results_thresh50"][ds_name] = metrics_50
             print(
-                f"TEST [{args.model_code} | {ds_name}] -> "
-                f"AUROC: {metrics['auroc']:.4f} | MCC: {metrics['mcc']:.4f} | "
-                f"Sens: {metrics['sens']:.4f} | Spec: {metrics['spec']:.4f} | J: {metrics['j']:.4f}"
+                f"TEST [{args.model_code} | {ds_name} | t*={optimal_threshold:.2f}] -> "
+                f"AUROC: {metrics_cal['auroc']:.4f} | MCC: {metrics_cal['mcc']:.4f} "
+                f"(t=0.50: {metrics_50['mcc']:.4f}) | Sens: {metrics_cal['sens']:.4f} | Spec: {metrics_cal['spec']:.4f}"
             )
         print("-" * 75)
 

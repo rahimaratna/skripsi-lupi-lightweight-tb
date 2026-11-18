@@ -9,8 +9,9 @@ from albumentations.pytorch import ToTensorV2
 
 def get_transforms(img_size: int = 224, is_train: bool = True):
     if is_train:
+        # Sesuai hlm. 3 paper: CLAHE baku diterapkan pada pipeline training
         return A.Compose([
-            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.5),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
             A.Resize(img_size, img_size, interpolation=cv2.INTER_AREA),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
@@ -24,8 +25,7 @@ def get_transforms(img_size: int = 224, is_train: bool = True):
 
 def read_split_csv(csv_path: str) -> pd.DataFrame:
     """
-    Membaca file CSV split dan mendeteksi otomatis jika file tidak memiliki baris header
-    (misalnya langsung berisi 'CHNCXR_0278_0.png,0' pada baris pertama).
+    Membaca file CSV split dan mendeteksi otomatis jika file tidak memiliki baris header.
     """
     df = pd.read_csv(csv_path)
     if len(df.columns) >= 2:
@@ -55,7 +55,6 @@ def _detect_column(df: pd.DataFrame, candidates: list[str], col_desc: str) -> st
 
 
 def _build_file_index(root_dir: str, valid_exts: tuple[str, ...]) -> dict[str, str]:
-    """Membangun indeks {nama_file: full_path} secara rekursif untuk mengantisipasi subfolder."""
     index = {}
     if not os.path.exists(root_dir):
         return index

@@ -1,7 +1,6 @@
 import time
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import models as tv_models
 from transformers import AutoModel
 
@@ -12,38 +11,28 @@ except ImportError:
     HAS_TIMM = False
 
 
-def _ends_with_3x3(module: nn.Module) -> bool:
-    """Mengecek apakah layer Conv2d terakhir pada feature extractor memiliki kernel 3x3."""
-    last_conv = None
-    for m in module.modules():
-        if isinstance(m, nn.Conv2d):
-            last_conv = m
-    if last_conv is None:
-        return True
-    return last_conv.kernel_size == (3, 3)
-
-
 class VisionEncoderWrapper(nn.Module):
     """
-    Wrapper backbone visual untuk M1-M8:
-    - M1: vgg11 (exact baseline paper)
-    - M2: mobilenet_v3_large
-    - M3: shufflenet_v2_x1_0
-    - M4: efficientnet_b0
-    - M5: starnet_s3 (timm)
-    - M6: resnet18
-    - M7: densenet121
-    - M8: ghostnet_100 (timm)
-    Menyisipkan blok post3x3 otomatis apabila konvolusi terakhir bukan 3x3 (sesuai paper).
+    Wrapper backbone visual untuk M1-M8 sesuai Fig. 1 Rajaraman et al. (2026):
+    Backbone -> Global Average Pooling (GAP) -> output vektor fitur (B, C)
+    Tanpa injeksi lapisan konvolusi tambahan agar parameter tetap ringan & pretrained utuh.
     """
 
-    def __init__(self, backbone_name: str = "vgg11", pretrained: bool = True):
+    def __init__(self, backbone_name: str = "vgg11_bn", pretrained: bool = True):
         super().__init__()
         self.backbone_name = backbone_name.lower()
         self.is_timm = False
 
-        if self.backbone_name == "vgg11":
-            m = tv_models.vgg11(weights=tv_models.VGG11_Weights.DEFAULT if pretrained else None)
+        if self.backbone_name == "vgg11_bn":
+            m = tv_models.vgg11_bn(
+                weights=tv_models.VGG11_BN_Weights.DEFAULT if pretrained else None
+            )
+            self.features = m.features
+            in_ch = 512
+        elif self.backbone_name == "vgg11":
+            m = tv_models.vgg11(
+                weights=tv_models.VGG11_Weights.DEFAULT if pretrained else None
+            )
             self.features = m.features
             in_ch = 512
         elif self.backbone_name in ("mobilenet_v3_large", "mobilenetv3"):
@@ -67,7 +56,9 @@ class VisionEncoderWrapper(nn.Module):
             self.features = m.features
             in_ch = 1280
         elif self.backbone_name == "resnet18":
-            m = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT if pretrained else None)
+            m = tv_models.resnet18(
+                weights=tv_models.ResNet18_Weights.DEFAULT if pretrained else None
+            )
             self.features = nn.Sequential(*list(m.children())[:-2])
             in_ch = 512
         elif self.backbone_name == "densenet121":
@@ -77,7 +68,6 @@ class VisionEncoderWrapper(nn.Module):
             self.features = m.features
             in_ch = 1024
         else:
-            # Untuk backbone timm seperti starnet_s3 dan ghostnet_100
             if not HAS_TIMM:
                 raise ValueError(f"Backbone '{backbone_name}' membutuhkan library timm.")
             timm_alias = {
@@ -91,33 +81,32 @@ class VisionEncoderWrapper(nn.Module):
             )
             with torch.no_grad():
                 dummy = torch.zeros(1, 3, 224, 224)
-                out = self.features(dummy)
+                out = self.features.forward_features(dummy) if hasattr(self.features, "forward_features") else self.features(dummy)
                 in_ch = out.shape[1]
-
-        if not _ends_with_3x3(self.features):
-            self.post3x3 = nn.Sequential(
-                nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=1, padding=1, bias=False),
-                nn.BatchNorm2d(in_ch),
-                nn.SiLU(inplace=True),
-            )
-        else:
-            self.post3x3 = nn.Identity()
 
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
         self.out_dim = in_ch
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.features(x)
-        feat = self.post3x3(feat)
-        pooled = self.gap(feat).flatten(1)
+        if self.is_timm and hasattr(self.features, "forward_features"):
+            feat = self.features.forward_features(x)
+        else:
+            feat = self.features(x)
+
+        if feat.ndim == 4:
+            pooled = self.gap(feat).flatten(1)
+        elif feat.ndim == 3:
+            pooled = feat.mean(dim=1)
+        else:
+            pooled = feat
         return pooled
 
 
 class PrivilegedTextEncoder(nn.Module):
     """
-    Encoder teks BiomedVLP-CXR-BERT-general dengan kebijakan fine-tuning 'authors_default'
-    (membekukan embeddings & pooler, membuka blok encoder terakhir layer[-1])
-    serta menggunakan pooler_output / [CLS] sesuai paper rujukan.
+    Encoder teks BiomedVLP-CXR-BERT-general.
+    Sesuai paper hlm. 5 & 6 ('authors_default'): seluruh bobot CXR-BERT dibekukan
+    dan dijaga dalam eval() mode untuk mencegah overfitting pada dataset kecil.
     """
 
     def __init__(
@@ -126,32 +115,41 @@ class PrivilegedTextEncoder(nn.Module):
         freeze_policy: str = "authors_default",
     ):
         super().__init__()
+        self.freeze_policy = freeze_policy
         self.bert = AutoModel.from_pretrained(model_name)
         self.out_dim = self.bert.config.hidden_size
         self.apply_freeze_policy(freeze_policy)
 
     def apply_freeze_policy(self, policy: str):
-        if policy == "freeze_all":
+        if policy in ("authors_default", "freeze_all"):
             for p in self.bert.parameters():
                 p.requires_grad = False
-        elif policy == "unfreeze_all":
-            for p in self.bert.parameters():
-                p.requires_grad = True
-        elif policy == "authors_default":
+            self.bert.eval()
+        elif policy == "unfreeze_last1":
             for p in self.bert.parameters():
                 p.requires_grad = False
             if hasattr(self.bert, "encoder") and hasattr(self.bert.encoder, "layer"):
                 for p in self.bert.encoder.layer[-1].parameters():
                     p.requires_grad = True
-            else:
-                for name, p in self.bert.named_parameters():
-                    if "encoder.layer.11." in name:
-                        p.requires_grad = True
+        elif policy == "unfreeze_all":
+            for p in self.bert.parameters():
+                p.requires_grad = True
         else:
             raise ValueError(f"freeze_policy tidak dikenal: {policy}")
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_policy in ("authors_default", "freeze_all"):
+            self.bert.eval()
+        return self
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        enc = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        if self.freeze_policy in ("authors_default", "freeze_all"):
+            with torch.no_grad():
+                enc = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        else:
+            enc = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+
         if getattr(enc, "pooler_output", None) is not None:
             return enc.pooler_output
         return enc.last_hidden_state[:, 0]
@@ -165,13 +163,10 @@ def measure_inference_efficiency(
     runs: int = 100,
 ) -> dict:
     """
-    Mengukur metrik efisiensi komputasi saat INFERENSI (hanya cabang visual + projection + cls):
-    - infer_params_m : Total parameter inferensi (Juta)
-    - infer_size_mb  : Ukuran model inferensi dalam FP32 (MB)
-    - latency_ms     : Rata-rata waktu inferensi per citra (ms)
+    Mengukur metrik efisiensi komputasi saat INFERENSI (hanya cabang visual + projection + cls).
     """
     model.eval()
-    infer_modules = [model.vision_encoder, model.img_proj, model.mid, model.cls]
+    infer_modules = [model.vision_encoder, model.img_dropout, model.img_proj, model.cls]
 
     total_params = sum(p.numel() for mod in infer_modules for p in mod.parameters())
     total_bytes = sum(
@@ -207,38 +202,41 @@ def measure_inference_efficiency(
 
 class TBClassifierUnimodal(nn.Module):
     """
-    Baseline Unimodal dengan projection head identik (Linear -> ReLU -> mid -> cls).
+    Baseline Unimodal sesuai Fig. 1 Rajaraman et al. (2026):
+    VisionEncoder (GAP) -> Dropout(0.3) -> Linear(C -> 256) -> Classifier(256 -> 2)
     """
 
     def __init__(
         self,
-        backbone_name: str = "vgg11",
+        backbone_name: str = "vgg11_bn",
         proj_dim: int = 256,
         num_classes: int = 2,
         pretrained: bool = True,
     ):
         super().__init__()
         self.vision_encoder = VisionEncoderWrapper(backbone_name, pretrained=pretrained)
+        self.img_dropout = nn.Dropout(p=0.3)
         self.img_proj = nn.Linear(self.vision_encoder.out_dim, proj_dim)
-        self.act = nn.ReLU(inplace=True)
-        self.mid = nn.Linear(proj_dim, proj_dim)
         self.cls = nn.Linear(proj_dim, num_classes)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        f_img = self.vision_encoder(images)
-        z_img = self.mid(self.act(self.img_proj(f_img)))
+        h_img = self.vision_encoder(images)
+        z_img = self.img_proj(self.img_dropout(h_img))
         logits = self.cls(z_img)
         return logits
 
 
 class TBClassifierLUPI(nn.Module):
     """
-    Model Multimodal LUPI sesuai arsitektur MultimodalNet pada paper rujukan.
+    Model Multimodal LUPI sesuai Fig. 1 Rajaraman et al. (2026):
+    - Image branch: VisionEncoder (GAP) -> Dropout(0.3) -> Linear(C -> 256)
+    - Text branch : Frozen CXR-BERT -> Dropout(0.1) -> Linear(768 -> 256)
+    - Shared classifier: Linear(256 -> 2)
     """
 
     def __init__(
         self,
-        backbone_name: str = "vgg11",
+        backbone_name: str = "vgg11_bn",
         text_model_name: str = "microsoft/BiomedVLP-CXR-BERT-general",
         proj_dim: int = 256,
         num_classes: int = 2,
@@ -251,11 +249,12 @@ class TBClassifierLUPI(nn.Module):
             model_name=text_model_name, freeze_policy=text_freeze_policy
         )
 
+        self.img_dropout = nn.Dropout(p=0.3)
+        self.txt_dropout = nn.Dropout(p=0.1)
+
         self.img_proj = nn.Linear(self.vision_encoder.out_dim, proj_dim)
         self.txt_proj = nn.Linear(self.text_encoder.out_dim, proj_dim)
-        self.act = nn.ReLU(inplace=True)
 
-        self.mid = nn.Linear(proj_dim, proj_dim)
         self.cls = nn.Linear(proj_dim, num_classes)
 
     def forward(
@@ -264,15 +263,15 @@ class TBClassifierLUPI(nn.Module):
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ):
-        f_img = self.vision_encoder(images)
-        z_img = self.mid(self.act(self.img_proj(f_img)))
+        h_img = self.vision_encoder(images)
+        z_img = self.img_proj(self.img_dropout(h_img))
         logits_img = self.cls(z_img)
 
         if input_ids is None or attention_mask is None:
             return logits_img
 
-        f_txt = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        z_txt = self.mid(self.act(self.txt_proj(f_txt)))
+        h_txt = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        z_txt = self.txt_proj(self.txt_dropout(h_txt))
         logits_txt = self.cls(z_txt)
 
         return logits_img, logits_txt, z_img, z_txt

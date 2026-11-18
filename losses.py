@@ -5,11 +5,10 @@ import torch.nn.functional as F
 
 class SymmetricNTXentLoss(nn.Module):
     """
-    Symmetric Contrastive NT-Xent Loss lintas-modalitas (image <-> text).
-    L2-normalization dilakukan secara lokal di sini sesuai implementasi paper.
+    Symmetric Contrastive NT-Xent Loss lintas-modalitas (Persamaan 6 Rajaraman et al., 2026).
     """
 
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self, temperature: float = 0.05):
         super().__init__()
         self.temperature = temperature
 
@@ -30,10 +29,11 @@ class SymmetricNTXentLoss(nn.Module):
 
 class LUPITotalLoss(nn.Module):
     """
-    Gabungan Loss Klasifikasi (Image + Text) dan Loss Alignment (NT-Xent + CosineEmbedding).
+    Persamaan (7) Rajaraman et al. (2026):
+    L_total = L_{c,img} + L_{c,txt} + L_cos + lambda * L_NTX(tau)
     """
 
-    def __init__(self, lambda_align: float = 0.5, temperature: float = 0.07):
+    def __init__(self, lambda_align: float = 0.6, temperature: float = 0.05):
         super().__init__()
         self.lambda_align = lambda_align
         self.ce = nn.CrossEntropyLoss()
@@ -55,8 +55,7 @@ class LUPITotalLoss(nn.Module):
         cos_target = torch.ones(z_img.size(0), device=z_img.device)
         loss_cos = self.cos_embed(z_img.float(), z_txt.float(), cos_target)
 
-        loss_align = loss_ntxent + loss_cos
-        total_loss = loss_cls_img + loss_cls_txt + self.lambda_align * loss_align
+        total_loss = loss_cls_img + loss_cls_txt + loss_cos + (self.lambda_align * loss_ntxent)
 
         metrics = {
             "total": total_loss.item(),
