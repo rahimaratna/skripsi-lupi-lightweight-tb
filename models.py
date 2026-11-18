@@ -1,200 +1,278 @@
-from typing import Dict, Optional
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as tvm
-import timm
+from torchvision import models as tv_models
 from transformers import AutoModel
+
+try:
+    import timm
+    HAS_TIMM = True
+except ImportError:
+    HAS_TIMM = False
+
+
+def _ends_with_3x3(module: nn.Module) -> bool:
+    """Mengecek apakah layer Conv2d terakhir pada feature extractor memiliki kernel 3x3."""
+    last_conv = None
+    for m in module.modules():
+        if isinstance(m, nn.Conv2d):
+            last_conv = m
+    if last_conv is None:
+        return True
+    return last_conv.kernel_size == (3, 3)
 
 
 class VisionEncoderWrapper(nn.Module):
-    SUPPORTED = {
-        "vgg11",
-        "resnet18",
-        "densenet121",
-        "mobilenetv3",
-        "shufflenetv2",
-        "efficientnet_b0",
-        "starnet",
-        "vit",
-    }
+    """
+    Wrapper backbone visual untuk M1-M8:
+    - M1: vgg11 (exact baseline paper)
+    - M2: mobilenet_v3_large
+    - M3: shufflenet_v2_x1_0
+    - M4: efficientnet_b0
+    - M5: starnet_s3 (timm)
+    - M6: resnet18
+    - M7: densenet121
+    - M8: ghostnet_100 (timm)
+    Menyisipkan blok post3x3 otomatis apabila konvolusi terakhir bukan 3x3 (sesuai paper).
+    """
 
-    def __init__(self, backbone_name: str = "vgg11",
-        "resnet18",
-        "densenet121", pretrained: bool = True):
+    def __init__(self, backbone_name: str = "vgg11", pretrained: bool = True):
         super().__init__()
-        name = backbone_name.lower().strip()
-        if name not in self.SUPPORTED:
-            raise ValueError(f"Backbone '{backbone_name}' tidak didukung. Pilih dari: {sorted(self.SUPPORTED)}")
+        self.backbone_name = backbone_name.lower()
+        self.is_timm = False
 
-        self.backbone_name = name
-
-        if name == "vgg11":
-            weights = tvm.VGG11_BN_Weights.DEFAULT if pretrained else None
-            m = tvm.vgg11_bn(weights=weights)
+        if self.backbone_name == "vgg11":
+            m = tv_models.vgg11(weights=tv_models.VGG11_Weights.DEFAULT if pretrained else None)
             self.features = m.features
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            self.out_dim = 512
-            self.is_timm = False
-
-        elif name == "resnet18":
-            weights = tvm.ResNet18_Weights.DEFAULT if pretrained else None
-            m = tvm.resnet18(weights=weights)
-            self.features = nn.Sequential(*list(m.children())[:-2])
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            self.out_dim = 512
-            self.is_timm = False
-
-        elif name == "densenet121":
-            weights = tvm.DenseNet121_Weights.DEFAULT if pretrained else None
-            m = tvm.densenet121(weights=weights)
-            self.features = nn.Sequential(m.features, nn.ReLU(inplace=True))
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            self.out_dim = 1024
-            self.is_timm = False
-
-        elif name == "mobilenetv3":
-            weights = tvm.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
-            m = tvm.mobilenet_v3_large(weights=weights)
+            in_ch = 512
+        elif self.backbone_name in ("mobilenet_v3_large", "mobilenetv3"):
+            m = tv_models.mobilenet_v3_large(
+                weights=tv_models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+            )
             self.features = m.features
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            self.out_dim = 960
-            self.is_timm = False
-
-        elif name == "shufflenetv2":
-            weights = tvm.ShuffleNet_V2_X1_0_Weights.DEFAULT if pretrained else None
-            m = tvm.shufflenet_v2_x1_0(weights=weights)
+            in_ch = 960
+        elif self.backbone_name in ("shufflenet_v2_x1_0", "shufflenetv2"):
+            m = tv_models.shufflenet_v2_x1_0(
+                weights=tv_models.ShuffleNet_V2_X1_0_Weights.DEFAULT if pretrained else None
+            )
             self.features = nn.Sequential(
                 m.conv1, m.maxpool, m.stage2, m.stage3, m.stage4, m.conv5
             )
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            self.out_dim = 1024
-            self.is_timm = False
-
-        elif name == "efficientnet_b0":
-            weights = tvm.EfficientNet_B0_Weights.DEFAULT if pretrained else None
-            m = tvm.efficientnet_b0(weights=weights)
+            in_ch = 1024
+        elif self.backbone_name in ("efficientnet_b0", "efficientnet"):
+            m = tv_models.efficientnet_b0(
+                weights=tv_models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+            )
             self.features = m.features
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            self.out_dim = 1280
-            self.is_timm = False
-
-        elif name == "starnet":
-            self.features = timm.create_model("starnet_s3", pretrained=pretrained, num_classes=0)
-            self.pool = nn.Identity()
-            self.out_dim = self.features.num_features
+            in_ch = 1280
+        elif self.backbone_name == "resnet18":
+            m = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT if pretrained else None)
+            self.features = nn.Sequential(*list(m.children())[:-2])
+            in_ch = 512
+        elif self.backbone_name == "densenet121":
+            m = tv_models.densenet121(
+                weights=tv_models.DenseNet121_Weights.DEFAULT if pretrained else None
+            )
+            self.features = m.features
+            in_ch = 1024
+        else:
+            # Untuk backbone timm seperti starnet_s3 dan ghostnet_100
+            if not HAS_TIMM:
+                raise ValueError(f"Backbone '{backbone_name}' membutuhkan library timm.")
+            timm_alias = {
+                "starnet": "starnet_s3",
+                "ghostnet": "ghostnet_100",
+            }
+            resolved_name = timm_alias.get(self.backbone_name, self.backbone_name)
             self.is_timm = True
+            self.features = timm.create_model(
+                resolved_name, pretrained=pretrained, num_classes=0, global_pool=""
+            )
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, 224, 224)
+                out = self.features(dummy)
+                in_ch = out.shape[1]
 
-        elif name == "vit":
-            self.features = timm.create_model("vit_tiny_patch16_224", pretrained=pretrained, num_classes=0)
-            self.pool = nn.Identity()
-            self.out_dim = self.features.num_features
-            self.is_timm = True
+        if not _ends_with_3x3(self.features):
+            self.post3x3 = nn.Sequential(
+                nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(in_ch),
+                nn.SiLU(inplace=True),
+            )
+        else:
+            self.post3x3 = nn.Identity()
+
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.out_dim = in_ch
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.features(x)
-        if not self.is_timm:
-            feat = self.pool(feat).flatten(1)
-        return feat
+        feat = self.post3x3(feat)
+        pooled = self.gap(feat).flatten(1)
+        return pooled
 
 
 class PrivilegedTextEncoder(nn.Module):
+    """
+    Encoder teks BiomedVLP-CXR-BERT-general dengan kebijakan fine-tuning 'authors_default'
+    (membekukan embeddings & pooler, membuka blok encoder terakhir layer[-1])
+    serta menggunakan pooler_output / [CLS] sesuai paper rujukan.
+    """
+
     def __init__(
         self,
         model_name: str = "microsoft/BiomedVLP-CXR-BERT-general",
-        proj_dim: int = 256,
-        freeze_policy: str = "freeze_all",
-        unfreeze_last_n: int = 0,
+        freeze_policy: str = "authors_default",
     ):
         super().__init__()
-        try:
-            self.encoder = AutoModel.from_pretrained(model_name, local_files_only=True, trust_remote_code=True)
-        except Exception:
-            self.encoder = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        self.bert = AutoModel.from_pretrained(model_name)
+        self.out_dim = self.bert.config.hidden_size
+        self.apply_freeze_policy(freeze_policy)
 
-        hidden_dim = self.encoder.config.hidden_size
-        self.dropout = nn.Dropout(0.1)
-        self.proj = nn.Linear(hidden_dim, proj_dim)
-        self._apply_freeze_policy(freeze_policy, unfreeze_last_n)
-
-    def _apply_freeze_policy(self, policy: str, last_n: int):
-        for p in self.encoder.parameters():
-            p.requires_grad = False
-
-        if policy == "train_all":
-            for p in self.encoder.parameters():
+    def apply_freeze_policy(self, policy: str):
+        if policy == "freeze_all":
+            for p in self.bert.parameters():
+                p.requires_grad = False
+        elif policy == "unfreeze_all":
+            for p in self.bert.parameters():
                 p.requires_grad = True
-        elif policy == "last_n":
-            layers = getattr(getattr(self.encoder, "encoder", None), "layer", None)
-            if layers is not None and last_n > 0:
-                for layer in layers[-last_n:]:
-                    for p in layer.parameters():
+        elif policy == "authors_default":
+            for p in self.bert.parameters():
+                p.requires_grad = False
+            if hasattr(self.bert, "encoder") and hasattr(self.bert.encoder, "layer"):
+                for p in self.bert.encoder.layer[-1].parameters():
+                    p.requires_grad = True
+            else:
+                for name, p in self.bert.named_parameters():
+                    if "encoder.layer.11." in name:
                         p.requires_grad = True
+        else:
+            raise ValueError(f"freeze_policy tidak dikenal: {policy}")
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-            token_emb = out.last_hidden_state
-            mask = attention_mask.unsqueeze(-1).expand(token_emb.size()).float()
-            pooled = torch.sum(token_emb * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-
-        h_txt = self.dropout(pooled)
-        z_txt = self.proj(h_txt)
-        return z_txt
+        enc = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        if getattr(enc, "pooler_output", None) is not None:
+            return enc.pooler_output
+        return enc.last_hidden_state[:, 0]
 
 
-class TBClassifierLUPI(nn.Module):
+def measure_inference_efficiency(
+    model: nn.Module,
+    device: torch.device,
+    img_size: int = 224,
+    warmup: int = 20,
+    runs: int = 100,
+) -> dict:
+    """
+    Mengukur metrik efisiensi komputasi saat INFERENSI (hanya cabang visual + projection + cls):
+    - infer_params_m : Total parameter inferensi (Juta)
+    - infer_size_mb  : Ukuran model inferensi dalam FP32 (MB)
+    - latency_ms     : Rata-rata waktu inferensi per citra (ms)
+    """
+    model.eval()
+    infer_modules = [model.vision_encoder, model.img_proj, model.mid, model.cls]
+
+    total_params = sum(p.numel() for mod in infer_modules for p in mod.parameters())
+    total_bytes = sum(
+        p.numel() * p.element_size() for mod in infer_modules for p in mod.parameters()
+    ) + sum(
+        b.numel() * b.element_size() for mod in infer_modules for b in mod.buffers()
+    )
+
+    dummy = torch.randn(1, 3, img_size, img_size, device=device)
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model(dummy)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        for _ in range(runs):
+            _ = model(dummy)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+    latency_ms = ((t1 - t0) / runs) * 1000.0
+    train_params = sum(p.numel() for p in model.parameters())
+
+    return {
+        "infer_params_m": round(total_params / 1e6, 3),
+        "infer_size_mb": round(total_bytes / (1024 ** 2), 3),
+        "latency_ms": round(latency_ms, 3),
+        "train_params_m": round(train_params / 1e6, 3),
+    }
+
+
+class TBClassifierUnimodal(nn.Module):
+    """
+    Baseline Unimodal dengan projection head identik (Linear -> ReLU -> mid -> cls).
+    """
+
     def __init__(
         self,
         backbone_name: str = "vgg11",
-        "resnet18",
-        "densenet121",
-        mode: str = "unimodal",
         proj_dim: int = 256,
         num_classes: int = 2,
         pretrained: bool = True,
-        text_model_name: str = "microsoft/BiomedVLP-CXR-BERT-general",
-        text_freeze_policy: str = "freeze_all",
-        unfreeze_last_n: int = 0,
     ):
         super().__init__()
-        assert mode in {"unimodal", "lupi"}, "mode harus 'unimodal' atau 'lupi'"
-        self.mode = mode
+        self.vision_encoder = VisionEncoderWrapper(backbone_name, pretrained=pretrained)
+        self.img_proj = nn.Linear(self.vision_encoder.out_dim, proj_dim)
+        self.act = nn.ReLU(inplace=True)
+        self.mid = nn.Linear(proj_dim, proj_dim)
+        self.cls = nn.Linear(proj_dim, num_classes)
 
-        self.vision_encoder = VisionEncoderWrapper(backbone_name=backbone_name, pretrained=pretrained)
-        self.vision_dropout = nn.Dropout(0.3)
-        self.vision_proj = nn.Linear(self.vision_encoder.out_dim, proj_dim)
-        self.classifier = nn.Linear(proj_dim, num_classes)
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        f_img = self.vision_encoder(images)
+        z_img = self.mid(self.act(self.img_proj(f_img)))
+        logits = self.cls(z_img)
+        return logits
 
-        self.text_encoder: Optional[PrivilegedTextEncoder] = None
-        if self.mode == "lupi":
-            self.text_encoder = PrivilegedTextEncoder(
-                model_name=text_model_name,
-                proj_dim=proj_dim,
-                freeze_policy=text_freeze_policy,
-                unfreeze_last_n=unfreeze_last_n,
-            )
+
+class TBClassifierLUPI(nn.Module):
+    """
+    Model Multimodal LUPI sesuai arsitektur MultimodalNet pada paper rujukan.
+    """
+
+    def __init__(
+        self,
+        backbone_name: str = "vgg11",
+        text_model_name: str = "microsoft/BiomedVLP-CXR-BERT-general",
+        proj_dim: int = 256,
+        num_classes: int = 2,
+        pretrained: bool = True,
+        text_freeze_policy: str = "authors_default",
+    ):
+        super().__init__()
+        self.vision_encoder = VisionEncoderWrapper(backbone_name, pretrained=pretrained)
+        self.text_encoder = PrivilegedTextEncoder(
+            model_name=text_model_name, freeze_policy=text_freeze_policy
+        )
+
+        self.img_proj = nn.Linear(self.vision_encoder.out_dim, proj_dim)
+        self.txt_proj = nn.Linear(self.text_encoder.out_dim, proj_dim)
+        self.act = nn.ReLU(inplace=True)
+
+        self.mid = nn.Linear(proj_dim, proj_dim)
+        self.cls = nn.Linear(proj_dim, num_classes)
 
     def forward(
         self,
-        image: torch.Tensor,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        v_feat = self.vision_encoder(image)
-        h_img = self.vision_dropout(v_feat)
-        z_img = self.vision_proj(h_img)
-        logits_img = self.classifier(z_img)
+        images: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        f_img = self.vision_encoder(images)
+        z_img = self.mid(self.act(self.img_proj(f_img)))
+        logits_img = self.cls(z_img)
 
-        outputs = {
-            "logits": logits_img,
-            "z_img": F.normalize(z_img, p=2, dim=-1),
-        }
+        if input_ids is None or attention_mask is None:
+            return logits_img
 
-        if self.mode == "lupi" and self.training and (input_ids is not None) and (attention_mask is not None):
-            z_txt = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-            logits_txt = self.classifier(z_txt)
-            outputs["logits_txt"] = logits_txt
-            outputs["z_txt"] = F.normalize(z_txt, p=2, dim=-1)
+        f_txt = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        z_txt = self.mid(self.act(self.txt_proj(f_txt)))
+        logits_txt = self.cls(z_txt)
 
-        return outputs
+        return logits_img, logits_txt, z_img, z_txt

@@ -1,23 +1,30 @@
-import argparse
-import json
 import os
+import json
 import random
+import argparse
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
     matthews_corrcoef,
+    f1_score,
     roc_auc_score,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    confusion_matrix,
 )
 
-from dataset import build_tokenizer, create_dataloader
-from models import TBClassifierLUPI
-from losses import TBMultimodalLoss
+from dataset import TBMultimodalDataset, get_transforms
+from models import (
+    TBClassifierUnimodal,
+    TBClassifierLUPI,
+    measure_inference_efficiency,
+)
+from losses import LUPITotalLoss
 
 
 def seed_everything(seed: int = 42):
@@ -29,284 +36,362 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict:
-    y_pred = (y_prob >= threshold).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+def load_splits(args):
+    if args.train_csv and args.val_csv:
+        train_df = pd.read_csv(args.train_csv)
+        val_df = pd.read_csv(args.val_csv)
+        test_df = (
+            pd.read_csv(args.test_csv)
+            if args.test_csv and os.path.exists(args.test_csv)
+            else None
+        )
+        return train_df, val_df, test_df
 
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0
-    youden_j = sensitivity + specificity - 1.0
-    try:
-        auc = float(roc_auc_score(y_true, y_prob))
-    except ValueError:
-        auc = 0.0
+    if args.csv_path and os.path.exists(args.csv_path):
+        df = pd.read_csv(args.csv_path)
+        split_col = next(
+            (c for c in ["split", "subset", "fold_split"] if c in df.columns), None
+        )
+        if split_col is None:
+            raise ValueError("CSV tunggal harus memiliki kolom 'split' (train/val/test).")
+        train_df = df[df[split_col].str.lower() == "train"].reset_index(drop=True)
+        val_df = df[
+            df[split_col].str.lower().isin(["val", "valid", "validation"])
+        ].reset_index(drop=True)
+        test_df = df[df[split_col].str.lower() == "test"].reset_index(drop=True)
+        return train_df, val_df, test_df if len(test_df) > 0 else None
 
-    return {
-        "tp": int(tp),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tn": int(tn),
-        "balanced_acc": float(balanced_accuracy_score(y_true, y_pred)),
-        "sensitivity": float(sensitivity),
-        "specificity": float(specificity),
-        "precision": float(precision),
-        "npv": float(npv),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "mcc": float(matthews_corrcoef(y_true, y_pred)),
-        "youden_j": float(youden_j),
-        "roc_auc": auc,
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-    }
+    train_path = os.path.join(args.data_dir, "train.csv")
+    val_path = os.path.join(args.data_dir, "val.csv")
+    test_path = os.path.join(args.data_dir, "test.csv")
+    if os.path.exists(train_path) and os.path.exists(val_path):
+        train_df = pd.read_csv(train_path)
+        val_df = pd.read_csv(val_path)
+        test_df = pd.read_csv(test_path) if os.path.exists(test_path) else None
+        return train_df, val_df, test_df
+
+    raise FileNotFoundError(
+        "Tidak ditemukan file CSV dataset. Berikan --csv_path atau --train_csv & --val_csv."
+    )
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader, device: torch.device) -> dict:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
     model.eval()
     all_labels = []
+    all_preds = []
     all_probs = []
-
-    for batch in loader:
-        images = batch["image"].to(device, non_blocking=True)
-        labels = batch["label"].numpy()
-
-        out = model(image=images)
-        probs = torch.softmax(out["logits"], dim=-1)[:, 1].cpu().numpy()
-
-        all_labels.append(labels)
-        all_probs.append(probs)
-
-    y_true = np.concatenate(all_labels, axis=0)
-    y_prob = np.concatenate(all_probs, axis=0)
-    return compute_metrics(y_true, y_prob)
-
-
-def train_one_epoch(
-    model: nn.Module,
-    loader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
-    device: torch.device,
-    mode: str,
-    grad_clip: float = 1.0,
-) -> dict:
-    model.train()
-    total_loss = 0.0
-    total_ce = 0.0
-    total_align = 0.0
-    steps = 0
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        input_ids = batch["input_ids"].to(device, non_blocking=True) if mode == "lupi" else None
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True) if mode == "lupi" else None
+        logits = model(images)
+        probs = torch.softmax(logits, dim=-1)[:, 1]
+        preds = torch.argmax(logits, dim=-1)
 
-        optimizer.zero_grad(set_to_none=True)
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-            out = model(image=images, input_ids=input_ids, attention_mask=attention_mask)
-            loss_dict = criterion(
-                logits=out["logits"],
-                labels=labels,
-                z_img=out.get("z_img"),
-                z_txt=out.get("z_txt"),
-                logits_txt=out.get("logits_txt"),
-            )
-            loss = loss_dict["loss"]
+    y_true = np.array(all_labels)
+    y_pred = np.array(all_preds)
+    y_prob = np.array(all_probs)
 
-        scaler.scale(loss).backward()
-        if grad_clip > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+    mcc = matthews_corrcoef(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    sens = recall_score(y_true, y_pred, zero_division=0)  # Sensitivity / TPR
 
-        total_loss += float(loss.item())
-        total_ce += float(loss_dict["loss_ce"].item())
-        total_align += float(loss_dict["loss_align"].item())
-        steps += 1
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0  # Specificity / TNR
+
+    try:
+        auc = roc_auc_score(y_true, y_prob)
+    except ValueError:
+        auc = 0.0
 
     return {
-        "train_loss": total_loss / max(steps, 1),
-        "train_ce": total_ce / max(steps, 1),
-        "train_align": total_align / max(steps, 1),
+        "auc": float(auc),
+        "mcc": float(mcc),
+        "sens": float(sens),
+        "spec": float(spec),
+        "f1": float(f1),
+        "acc": float(acc),
+        "precision": float(prec),
+        "confusion_matrix": cm.tolist(),
     }
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Eksperimen TB Classification: Unimodal vs Multimodal LUPI")
-    parser.add_argument("--backbone", type=str, required=True,
-                        choices=["vgg11", "resnet18", "densenet121", "mobilenetv3", "shufflenetv2", "efficientnet_b0", "starnet", "vit"],
-                        help="Pilihan vision encoder M1-M5")
-    parser.add_argument("--mode", type=str, required=True, choices=["unimodal", "lupi"],
-                        help="Skema pelatihan: unimodal atau lupi")
-
-    parser.add_argument("--train_csv", type=str, required=True, help="CSV split train Shenzhen")
-    parser.add_argument("--val_csv", type=str, required=True, help="CSV split validation Shenzhen")
-    parser.add_argument("--test_shenzhen_csv", type=str, required=True, help="CSV split test Shenzhen")
-    parser.add_argument("--test_montgomery_csv", type=str, default="", help="CSV uji eksternal Montgomery")
-    parser.add_argument("--test_tbx11k_csv", type=str, default="", help="CSV uji eksternal TBX11K")
-    parser.add_argument("--root_dir", type=str, default="", help="Prefix folder gambar")
-    parser.add_argument("--reports_dir", type=str, default="", help="Folder berisi file .txt laporan klinis")
-
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--lambda_align", type=float, default=0.5, help="Bobot alignment loss untuk mode LUPI")
-    parser.add_argument("--temperature", type=float, default=0.07, help="Temperature SupCon loss")
-    parser.add_argument("--proj_dim", type=int, default=256)
-    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience berdasarkan Val MCC")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--output_dir", type=str, default="outputs")
-    return parser.parse_args()
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description="Training Unimodal vs LUPI TB Classification (M1-M8)"
+    )
+    parser.add_argument("--model_code", type=str, default="M1-L")
+    parser.add_argument("--mode", type=str, default="lupi", choices=["unimodal", "lupi"])
+    parser.add_argument("--backbone", type=str, default="vgg11")
+    parser.add_argument(
+        "--text_model", type=str, default="microsoft/BiomedVLP-CXR-BERT-general"
+    )
+    parser.add_argument("--text_freeze_policy", type=str, default="authors_default")
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--csv_path", type=str, default="")
+    parser.add_argument("--train_csv", type=str, default="")
+    parser.add_argument("--val_csv", type=str, default="")
+    parser.add_argument("--test_csv", type=str, default="")
+    parser.add_argument("--report_dir", type=str, default="reports")
+    parser.add_argument("--img_size", type=int, default=224)
+    parser.add_argument("--max_len", type=int, default=512)
+    parser.add_argument("--proj_dim", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=64)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--lambda_align", type=float, default=0.6)
+    parser.add_argument("--temperature", type=float, default=0.05)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--output_dir", type=str, default="./outputs")
+    args = parser.parse_args()
+
     seed_everything(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    exp_name = f"{args.backbone}_{args.mode}_seed{args.seed}"
-    save_dir = os.path.join(args.output_dir, exp_name)
-    os.makedirs(save_dir, exist_ok=True)
+    print("=" * 75)
+    print(
+        f"[{args.model_code}] Mode: {args.mode} | Backbone: {args.backbone} | Seed: {args.seed}"
+    )
+    if args.mode == "lupi":
+        print(
+            f"LUPI PARAMS | report_dir={args.report_dir} | lambda={args.lambda_align} | "
+            f"tau={args.temperature} | freeze={args.text_freeze_policy}"
+        )
+    print("=" * 75)
 
-    print(f"=== Memulai Eksperimen: {exp_name} | Device: {device} ===")
+    train_df, val_df, test_df = load_splits(args)
+    tokenizer = (
+        AutoTokenizer.from_pretrained(args.text_model) if args.mode == "lupi" else None
+    )
 
-    tokenizer = build_tokenizer() if args.mode == "lupi" else None
-
-    train_loader = create_dataloader(
-        csv_path=args.train_csv,
-        batch_size=args.batch_size,
-        is_train=True,
-        require_text=(args.mode == "lupi"),
+    train_dataset = TBMultimodalDataset(
+        df=train_df,
+        data_dir=args.data_dir,
+        report_dir=args.report_dir,
+        mode=args.mode,
         tokenizer=tokenizer,
-        use_balanced_sampler=True,
-        num_workers=args.num_workers,
-        root_dir=args.root_dir,
-        reports_dir=args.reports_dir,
+        max_len=args.max_len,
+        transform=get_transforms(args.img_size, is_train=True),
+        require_report=(args.mode == "lupi"),
     )
-    val_loader = create_dataloader(
-        csv_path=args.val_csv,
+    val_dataset = TBMultimodalDataset(
+        df=val_df,
+        data_dir=args.data_dir,
+        report_dir=args.report_dir,
+        mode="unimodal",
+        tokenizer=None,
+        transform=get_transforms(args.img_size, is_train=False),
+        require_report=False,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
-        is_train=False,
-        require_text=False,
+        shuffle=True,
         num_workers=args.num_workers,
-        root_dir=args.root_dir,
+        pin_memory=True,
+        drop_last=(args.mode == "lupi"),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
 
-    model = TBClassifierLUPI(
-        backbone_name=args.backbone,
-        mode=args.mode,
-        proj_dim=args.proj_dim,
-        pretrained=True,
-    ).to(device)
+    if args.mode == "unimodal":
+        model = TBClassifierUnimodal(
+            backbone_name=args.backbone,
+            proj_dim=args.proj_dim,
+            num_classes=2,
+            pretrained=True,
+        ).to(device)
+        criterion = nn.CrossEntropyLoss()
+    else:
+        model = TBClassifierLUPI(
+            backbone_name=args.backbone,
+            text_model_name=args.text_model,
+            proj_dim=args.proj_dim,
+            num_classes=2,
+            pretrained=True,
+            text_freeze_policy=args.text_freeze_policy,
+        ).to(device)
+        criterion = LUPITotalLoss(
+            lambda_align=args.lambda_align,
+            temperature=args.temperature,
+        )
 
-    criterion = TBMultimodalLoss(
-        mode=args.mode,
-        lambda_align=args.lambda_align,
-        temperature=args.temperature,
+    efficiency = measure_inference_efficiency(model, device, img_size=args.img_size)
+    print(
+        f"Efficiency ({args.model_code}) -> Infer Params: {efficiency['infer_params_m']}M | "
+        f"Size: {efficiency['infer_size_mb']}MB | Latency: {efficiency['latency_ms']}ms"
     )
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+        trainable_params, lr=args.lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     best_val_mcc = -1.0
+    best_epoch = 0
     epochs_no_improve = 0
-    best_ckpt_path = os.path.join(save_dir, f"best_{exp_name}.pt")
+    best_ckpt_path = os.path.join(args.output_dir, "best_model.pt")
     history = []
 
     for epoch in range(1, args.epochs + 1):
-        tr_stats = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-            mode=args.mode,
-        )
-        val_stats = evaluate(model, val_loader, device)
-        scheduler.step()
+        model.train()
+        running_loss = 0.0
+        running_cls_img = 0.0
+        running_cls_txt = 0.0
+        running_ntxent = 0.0
+        running_cos = 0.0
+        steps = 0
 
-        row = {"epoch": epoch, **tr_stats, **{f"val_{k}": v for k, v in val_stats.items()}}
-        history.append(row)
+        for batch in train_loader:
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
 
-        print(
-            f"[Epoch {epoch:02d}/{args.epochs:02d}] "
-            f"Loss: {tr_stats['train_loss']:.4f} | "
-            f"Val MCC: {val_stats['mcc']:.4f} | "
-            f"Val BAcc: {val_stats['balanced_acc']:.4f} | "
-            f"Val AUC: {val_stats['roc_auc']:.4f}"
-        )
+            optimizer.zero_grad()
 
-        if val_stats["mcc"] > best_val_mcc:
-            best_val_mcc = val_stats["mcc"]
+            if args.mode == "unimodal":
+                logits = model(images)
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+                running_cls_img += loss.item()
+            else:
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+
+                logits_img, logits_txt, z_img, z_txt = model(
+                    images, input_ids=input_ids, attention_mask=attention_mask
+                )
+                loss, loss_parts = criterion(
+                    logits_img, logits_txt, z_img, z_txt, labels
+                )
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss_parts["total"]
+                running_cls_img += loss_parts["cls_img"]
+                running_cls_txt += loss_parts["cls_txt"]
+                running_ntxent += loss_parts["ntxent"]
+                running_cos += loss_parts["cos"]
+
+            steps += 1
+
+        avg_loss = running_loss / max(steps, 1)
+        val_metrics = evaluate(model, val_loader, device)
+        val_mcc = val_metrics["mcc"]
+
+        row_log = {
+            "epoch": epoch,
+            "train_loss": round(avg_loss, 4),
+            "cls_img": round(running_cls_img / max(steps, 1), 4),
+            "cls_txt": round(running_cls_txt / max(steps, 1), 4),
+            "ntxent": round(running_ntxent / max(steps, 1), 4),
+            "cos": round(running_cos / max(steps, 1), 4),
+            "val_auc": round(val_metrics["auc"], 4),
+            "val_mcc": round(val_mcc, 4),
+            "val_sens": round(val_metrics["sens"], 4),
+            "val_spec": round(val_metrics["spec"], 4),
+            "val_f1": round(val_metrics["f1"], 4),
+            "val_acc": round(val_metrics["acc"], 4),
+        }
+        history.append(row_log)
+
+        if args.mode == "lupi":
+            print(
+                f"Epoch {epoch:02d}/{args.epochs:02d} | Loss: {avg_loss:.4f} "
+                f"(cls_i={row_log['cls_img']:.3f}, cls_t={row_log['cls_txt']:.3f}, "
+                f"ntx={row_log['ntxent']:.3f}, cos={row_log['cos']:.3f}) | "
+                f"Val MCC: {val_mcc:.4f} | AUC: {val_metrics['auc']:.4f}"
+            )
+        else:
+            print(
+                f"Epoch {epoch:02d}/{args.epochs:02d} | Loss: {avg_loss:.4f} | "
+                f"Val MCC: {val_mcc:.4f} | AUC: {val_metrics['auc']:.4f}"
+            )
+
+        if val_mcc > best_val_mcc:
+            best_val_mcc = val_mcc
+            best_epoch = epoch
             epochs_no_improve = 0
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "val_mcc": best_val_mcc,
-                "args": vars(args),
-            }, best_ckpt_path)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "val_metrics": val_metrics,
+                    "args": vars(args),
+                },
+                best_ckpt_path,
+            )
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= args.patience:
-                print(f"Early stopping terpicu pada epoch {epoch} (Best Val MCC: {best_val_mcc:.4f})")
+                print(
+                    f"Early stopping di epoch {epoch} (best Val MCC: {best_val_mcc:.4f} @ ep {best_epoch})"
+                )
                 break
 
-    pd.DataFrame(history).to_csv(os.path.join(save_dir, "training_history.csv"), index=False)
+    pd.DataFrame(history).to_csv(os.path.join(args.output_dir, "history.csv"), index=False)
 
-    print("=== Memuat Checkpoint Terbaik untuk Evaluasi Test & Eksternal ===")
-    ckpt = torch.load(best_ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-
-    eval_targets = {"shenzhen_test": args.test_shenzhen_csv}
-    if args.test_montgomery_csv:
-        eval_targets["montgomery_ext"] = args.test_montgomery_csv
-    if args.test_tbx11k_csv:
-        eval_targets["tbx11k_ext"] = args.test_tbx11k_csv
-
-    final_results = {
-        "experiment": exp_name,
-        "backbone": args.backbone,
-        "mode": args.mode,
-        "best_epoch": ckpt["epoch"],
+    summary = {
+        "model_code": args.model_code,
+        "config": vars(args),
+        "efficiency": efficiency,
+        "best_epoch": best_epoch,
         "best_val_mcc": best_val_mcc,
-        "datasets": {},
     }
 
-    for ds_name, csv_file in eval_targets.items():
-        test_loader = create_dataloader(
-            csv_path=csv_file,
-            batch_size=args.batch_size,
-            is_train=False,
-            require_text=False,
-            num_workers=args.num_workers,
-            root_dir=args.root_dir,
-        )
-        metrics = evaluate(model, test_loader, device)
-        final_results["datasets"][ds_name] = metrics
-        print(
-            f"[{ds_name.upper()}] MCC: {metrics['mcc']:.4f} | "
-            f"BAcc: {metrics['balanced_acc']:.4f} | "
-            f"AUC: {metrics['roc_auc']:.4f} | "
-            f"Sens: {metrics['sensitivity']:.4f} | "
-            f"Spec: {metrics['specificity']:.4f}"
-        )
+    if test_df is not None and len(test_df) > 0:
+        ckpt = torch.load(best_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
 
-    with open(os.path.join(save_dir, "eval_results.json"), "w") as f:
-        json.dump(final_results, f, indent=2)
+        test_dataset = TBMultimodalDataset(
+            df=test_df,
+            data_dir=args.data_dir,
+            report_dir=args.report_dir,
+            mode="unimodal",
+            tokenizer=None,
+            transform=get_transforms(args.img_size, is_train=False),
+            require_report=False,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        test_metrics = evaluate(model, test_loader, device)
+        summary["test_metrics"] = test_metrics
+        print("-" * 75)
+        print(
+            f"TEST [{args.model_code} | {args.backbone} | seed={args.seed}] -> "
+            f"AUC: {test_metrics['auc']:.4f} | MCC: {test_metrics['mcc']:.4f} | "
+            f"Sens: {test_metrics['sens']:.4f} | Spec: {test_metrics['spec']:.4f}"
+        )
+        print("-" * 75)
+
+    with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
 
 
 if __name__ == "__main__":
