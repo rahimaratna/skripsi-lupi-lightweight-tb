@@ -8,12 +8,6 @@ from albumentations.pytorch import ToTensorV2
 
 
 def get_transforms(img_size: int = 224, is_train: bool = True):
-    """
-    Pipeline augmentasi identik dengan paper rujukan:
-    - Train: CLAHE (p=0.5) -> Resize (INTER_AREA) -> Normalize -> ToTensorV2
-    - Val/Test: Resize (INTER_AREA) -> Normalize -> ToTensorV2
-    Tanpa HorizontalFlip / Rotasi agar orientasi anatomi paru tetap selaras dengan laporan.
-    """
     if is_train:
         return A.Compose([
             A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.5),
@@ -35,11 +29,19 @@ def _detect_column(df: pd.DataFrame, candidates: list[str], col_desc: str) -> st
     raise ValueError(f"Kolom {col_desc} tidak ditemukan. Kolom tersedia: {list(df.columns)}")
 
 
-class TBMultimodalDataset(Dataset):
-    """
-    Dataset untuk mode 'unimodal' (citra saja) dan 'lupi' (citra + laporan klinis saat training).
-    """
+def _build_file_index(root_dir: str, valid_exts: tuple[str, ...]) -> dict[str, str]:
+    """Membangun indeks {nama_file: full_path} secara rekursif untuk mengantisipasi subfolder."""
+    index = {}
+    if not os.path.exists(root_dir):
+        return index
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fname in filenames:
+            if fname.lower().endswith(valid_exts):
+                index[fname] = os.path.join(dirpath, fname)
+    return index
 
+
+class TBMultimodalDataset(Dataset):
     def __init__(
         self,
         df: pd.DataFrame,
@@ -70,20 +72,33 @@ class TBMultimodalDataset(Dataset):
             None,
         )
 
+        # Indeks otomatis untuk folder images/ dan reports/ (termasuk jika ada subfolder)
+        img_index = _build_file_index(
+            os.path.join(data_dir, "images"), (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+        )
+        txt_index = (
+            _build_file_index(os.path.join(data_dir, report_dir), (".txt",))
+            if (self.mode == "lupi" and require_report)
+            else {}
+        )
+
         self.samples = []
         skipped_missing_img = 0
         skipped_missing_txt = 0
 
         for _, row in df.iterrows():
             rel_img = str(row[img_col]).strip()
-            img_path = rel_img if os.path.isabs(rel_img) else os.path.join(data_dir, rel_img)
-            if not os.path.exists(img_path):
-                alt_img = os.path.join(data_dir, "images", os.path.basename(rel_img))
-                if os.path.exists(alt_img):
-                    img_path = alt_img
-                else:
-                    skipped_missing_img += 1
-                    continue
+            base_img = os.path.basename(rel_img)
+
+            if os.path.isabs(rel_img) and os.path.exists(rel_img):
+                img_path = rel_img
+            elif os.path.exists(os.path.join(data_dir, rel_img)):
+                img_path = os.path.join(data_dir, rel_img)
+            elif base_img in img_index:
+                img_path = img_index[base_img]
+            else:
+                skipped_missing_img += 1
+                continue
 
             label = int(row[label_col])
             report_text = ""
@@ -91,18 +106,21 @@ class TBMultimodalDataset(Dataset):
             if self.mode == "lupi" and require_report:
                 if report_col is not None and pd.notna(row[report_col]):
                     rel_txt = str(row[report_col]).strip()
-                    txt_path = (
-                        rel_txt
-                        if os.path.isabs(rel_txt)
-                        else os.path.join(data_dir, self.report_dir, os.path.basename(rel_txt))
-                    )
-                    if not os.path.exists(txt_path):
-                        txt_path = os.path.join(data_dir, rel_txt)
+                    base_txt = os.path.basename(rel_txt)
                 else:
-                    stem = os.path.splitext(os.path.basename(img_path))[0]
-                    txt_path = os.path.join(data_dir, self.report_dir, f"{stem}.txt")
+                    stem = os.path.splitext(base_img)[0]
+                    rel_txt = os.path.join(report_dir, f"{stem}.txt")
+                    base_txt = f"{stem}.txt"
 
-                if not os.path.exists(txt_path):
+                if os.path.isabs(rel_txt) and os.path.exists(rel_txt):
+                    txt_path = rel_txt
+                elif os.path.exists(os.path.join(data_dir, report_dir, base_txt)):
+                    txt_path = os.path.join(data_dir, report_dir, base_txt)
+                elif os.path.exists(os.path.join(data_dir, rel_txt)):
+                    txt_path = os.path.join(data_dir, rel_txt)
+                elif base_txt in txt_index:
+                    txt_path = txt_index[base_txt]
+                else:
                     skipped_missing_txt += 1
                     continue
 

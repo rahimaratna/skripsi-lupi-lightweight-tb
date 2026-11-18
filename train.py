@@ -166,6 +166,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument(
+        "--test_csvs",
+        nargs="*",
+        default=[],
+        help="Pasangan NamaDataset=PathCSV, contoh: Shenzhen=/path/label_test.csv Montgomery=/path/label_test_mont.csv",
+    )
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -371,34 +377,48 @@ def main():
         "best_val_mcc": best_val_mcc,
     }
 
-    if test_df is not None and len(test_df) > 0:
+    # Evaluasi akhir pada seluruh Test Set yang diberikan (Shenzhen, Montgomery, TBX11K)
+    test_targets = []
+    if args.test_csvs:
+        for item in args.test_csvs:
+            if "=" in item:
+                ds_name, ds_path = item.split("=", 1)
+                if os.path.exists(ds_path):
+                    test_targets.append((ds_name, ds_path))
+    elif test_df is not None and len(test_df) > 0:
+        test_targets.append(("Default", args.test_csv))
+
+    if len(test_targets) > 0:
         ckpt = torch.load(best_ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
+        summary["test_results"] = {}
 
-        test_dataset = TBMultimodalDataset(
-            df=test_df,
-            data_dir=args.data_dir,
-            report_dir=args.report_dir,
-            mode="unimodal",
-            tokenizer=None,
-            transform=get_transforms(args.img_size, is_train=False),
-            require_report=False,
-        )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
-        test_metrics = evaluate(model, test_loader, device)
-        summary["test_metrics"] = test_metrics
         print("-" * 75)
-        print(
-            f"TEST [{args.model_code} | {args.backbone} | seed={args.seed}] -> "
-            f"AUC: {test_metrics['auc']:.4f} | MCC: {test_metrics['mcc']:.4f} | "
-            f"Sens: {test_metrics['sens']:.4f} | Spec: {test_metrics['spec']:.4f}"
-        )
+        for ds_name, ds_path in test_targets:
+            cur_test_df = pd.read_csv(ds_path) if ds_path else test_df
+            test_dataset = TBMultimodalDataset(
+                df=cur_test_df,
+                data_dir=args.data_dir,
+                report_dir=args.report_dir,
+                mode="unimodal",
+                tokenizer=None,
+                transform=get_transforms(args.img_size, is_train=False),
+                require_report=False,
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+            )
+            metrics = evaluate(model, test_loader, device)
+            summary["test_results"][ds_name] = metrics
+            print(
+                f"TEST [{args.model_code} | {ds_name}] -> "
+                f"AUROC: {metrics['auroc']:.4f} | MCC: {metrics['mcc']:.4f} | "
+                f"Sens: {metrics['sens']:.4f} | Spec: {metrics['spec']:.4f} | J: {metrics['j']:.4f}"
+            )
         print("-" * 75)
 
     with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
