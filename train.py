@@ -18,7 +18,7 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-from dataset import TBMultimodalDataset, get_transforms
+from dataset import TBMultimodalDataset, get_transforms, read_split_csv
 from models import (
     TBClassifierUnimodal,
     TBClassifierLUPI,
@@ -38,17 +38,17 @@ def seed_everything(seed: int = 42):
 
 def load_splits(args):
     if args.train_csv and args.val_csv:
-        train_df = pd.read_csv(args.train_csv)
-        val_df = pd.read_csv(args.val_csv)
+        train_df = read_split_csv(args.train_csv)
+        val_df = read_split_csv(args.val_csv)
         test_df = (
-            pd.read_csv(args.test_csv)
+            read_split_csv(args.test_csv)
             if args.test_csv and os.path.exists(args.test_csv)
             else None
         )
         return train_df, val_df, test_df
 
     if args.csv_path and os.path.exists(args.csv_path):
-        df = pd.read_csv(args.csv_path)
+        df = read_split_csv(args.csv_path)
         split_col = next(
             (c for c in ["split", "subset", "fold_split"] if c in df.columns), None
         )
@@ -395,7 +395,7 @@ def main():
 
         print("-" * 75)
         for ds_name, ds_path in test_targets:
-            cur_test_df = pd.read_csv(ds_path) if ds_path else test_df
+            cur_test_df = read_split_csv(ds_path) if ds_path else test_df
             test_dataset = TBMultimodalDataset(
                 df=cur_test_df,
                 data_dir=args.data_dir,

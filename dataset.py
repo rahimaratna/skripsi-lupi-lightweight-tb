@@ -22,6 +22,31 @@ def get_transforms(img_size: int = 224, is_train: bool = True):
     ])
 
 
+def read_split_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Membaca file CSV split dan mendeteksi otomatis jika file tidak memiliki baris header
+    (misalnya langsung berisi 'CHNCXR_0278_0.png,0' pada baris pertama).
+    """
+    df = pd.read_csv(csv_path)
+    if len(df.columns) >= 2:
+        first_col = str(df.columns[0]).strip().lower()
+        second_col = str(df.columns[1]).strip()
+        known_headers = {"image_path", "image", "img_path", "filename", "file_name"}
+
+        if first_col not in known_headers and (
+            first_col.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"))
+            or second_col in ("0", "1")
+        ):
+            df = pd.read_csv(csv_path, header=None)
+            if df.shape[1] == 2:
+                df.columns = ["image_path", "label"]
+            elif df.shape[1] >= 3:
+                df.columns = ["image_path", "label", "report_path"] + [
+                    f"col_{i}" for i in range(3, df.shape[1])
+                ]
+    return df
+
+
 def _detect_column(df: pd.DataFrame, candidates: list[str], col_desc: str) -> str:
     for col in candidates:
         if col in df.columns:
@@ -72,7 +97,6 @@ class TBMultimodalDataset(Dataset):
             None,
         )
 
-        # Indeks otomatis untuk folder images/ dan reports/ (termasuk jika ada subfolder)
         img_index = _build_file_index(
             os.path.join(data_dir, "images"), (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
         )
